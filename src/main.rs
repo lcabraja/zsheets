@@ -74,7 +74,7 @@ fn main() {
                     cx,
                 ))),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("Spreadsheet".into()),
+                    title: Some("zsheets".into()),
                     appears_transparent: false,
                     ..Default::default()
                 }),
