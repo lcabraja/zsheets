@@ -594,6 +594,7 @@ pub struct CellInputPrepaintState {
     cursor_opacity: f32,
     selection: Option<PaintQuad>,
     scroll_offset: Pixels,
+    vertical_offset: Pixels,
 }
 
 impl IntoElement for CellInputElement {
@@ -686,6 +687,13 @@ impl Element for CellInputElement {
         };
 
         let font_size = style.font_size.to_pixels(window.rem_size());
+
+        // Calculate vertical offset to center on x-height rather than cap-height
+        let font_id = window.text_system().resolve_font(&style.font());
+        let cap_height = window.text_system().cap_height(font_id, font_size);
+        let x_height = window.text_system().x_height(font_id, font_size);
+        let vertical_offset = (cap_height - x_height) / 2.0;
+
         let line = if display_text.is_empty() {
             window.text_system().shape_line(" ".into(), font_size, &[TextRun {
                 len: 1,
@@ -756,6 +764,7 @@ impl Element for CellInputElement {
             cursor_opacity,
             selection,
             scroll_offset,
+            vertical_offset,
         }
     }
 
@@ -780,9 +789,10 @@ impl Element for CellInputElement {
         }
         let line = prepaint.line.take().unwrap();
         let scroll_offset = prepaint.scroll_offset;
+        let vertical_offset = prepaint.vertical_offset;
 
-        // Paint text with scroll offset applied
-        let text_origin = point(bounds.origin.x - scroll_offset, bounds.origin.y);
+        // Paint text with scroll offset applied, using calculated x-height centering offset
+        let text_origin = point(bounds.origin.x - scroll_offset, bounds.origin.y + vertical_offset);
         line.paint(text_origin, window.line_height(), gpui::TextAlign::Left, None, window, cx)
             .unwrap();
 
