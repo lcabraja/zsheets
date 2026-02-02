@@ -2,6 +2,10 @@
 
 A 100x100 cell spreadsheet with vim-style modal editing, built with GPUI.
 
+## IMPORTANT: Check TODO.md on Load
+
+**Before starting any work, check `TODO.md` for known issues and pending tasks.**
+
 ## After Every Code Change
 
 After making any successful code edit, you MUST:

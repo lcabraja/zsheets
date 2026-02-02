@@ -5,6 +5,7 @@ mod file_io;
 mod file_state;
 mod grid;
 mod menu;
+mod metadata;
 mod state;
 mod theme;
 

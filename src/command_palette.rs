@@ -70,6 +70,20 @@ pub enum VimCommand {
     SaveAs(PathBuf),
     /// :new - new file
     New,
+    /// :autofit - auto-fit all columns and rows
+    AutoFitAll,
+    /// :autofit col - auto-fit current column
+    AutoFitColumn,
+    /// :autofit row - auto-fit current row
+    AutoFitRow,
+    /// :autofit watch - toggle auto-fit watch mode for all
+    AutoFitWatch,
+    /// :autofit col watch - toggle auto-fit watch for current column
+    AutoFitColumnWatch,
+    /// :autofit row watch - toggle auto-fit watch for current row
+    AutoFitRowWatch,
+    /// :resetsize - reset all column widths and row heights to defaults
+    ResetAllSizes,
 }
 
 impl VimCommand {
@@ -80,9 +94,10 @@ impl VimCommand {
         }
 
         let input = &input[1..]; // Remove leading ':'
-        let parts: Vec<&str> = input.splitn(2, ' ').collect();
+        let parts: Vec<&str> = input.splitn(3, ' ').collect();
         let cmd = parts[0];
         let arg = parts.get(1).map(|s| s.trim());
+        let arg2 = parts.get(2).map(|s| s.trim());
 
         match cmd {
             "w" if arg.is_none() => Some(VimCommand::Write),
@@ -95,6 +110,14 @@ impl VimCommand {
             "vi" | "view" if arg.is_some() => Some(VimCommand::View(PathBuf::from(arg.unwrap()))),
             "saveas" if arg.is_some() => Some(VimCommand::SaveAs(PathBuf::from(arg.unwrap()))),
             "new" => Some(VimCommand::New),
+            // Auto-fit commands
+            "autofit" if arg.is_none() => Some(VimCommand::AutoFitAll),
+            "autofit" if arg == Some("col") && arg2.is_none() => Some(VimCommand::AutoFitColumn),
+            "autofit" if arg == Some("row") && arg2.is_none() => Some(VimCommand::AutoFitRow),
+            "autofit" if arg == Some("watch") => Some(VimCommand::AutoFitWatch),
+            "autofit" if arg == Some("col") && arg2 == Some("watch") => Some(VimCommand::AutoFitColumnWatch),
+            "autofit" if arg == Some("row") && arg2 == Some("watch") => Some(VimCommand::AutoFitRowWatch),
+            "resetsize" => Some(VimCommand::ResetAllSizes),
             _ => None,
         }
     }
@@ -132,6 +155,17 @@ pub const COMMANDS: &[Command] = &[
     // View commands
     Command::new("toggle_read_only", "Toggle Read-Only")
         .with_vim(":view"),
+    // Sizing commands
+    Command::new("autofit_all", "Auto-fit All Columns & Rows")
+        .with_vim(":autofit"),
+    Command::new("autofit_column", "Auto-fit Current Column")
+        .with_vim(":autofit col"),
+    Command::new("autofit_row", "Auto-fit Current Row")
+        .with_vim(":autofit row"),
+    Command::new("autofit_watch", "Toggle Auto-fit Watch Mode")
+        .with_vim(":autofit watch"),
+    Command::new("reset_sizes", "Reset All Column & Row Sizes")
+        .with_vim(":resetsize"),
 ];
 
 pub struct CommandPalette {

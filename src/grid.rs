@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use gpui::prelude::FluentBuilder;
@@ -7,11 +8,15 @@ use crate::cell::CellInput;
 use crate::command_palette::{CommandPalette, HideCommandPalette, ShowCommandPalette, VimCommand};
 use crate::file_io;
 use crate::file_state::FileState;
+use crate::metadata::SpreadsheetMetadata;
 use crate::state::{CellPosition, Mode, GRID_COLS, GRID_ROWS};
 use crate::Theme;
 
-pub const CELL_WIDTH: f32 = 100.0;
-pub const CELL_HEIGHT: f32 = 28.0;
+pub const DEFAULT_CELL_WIDTH: f32 = 100.0;
+pub const DEFAULT_CELL_HEIGHT: f32 = 28.0;
+pub const MIN_CELL_WIDTH: f32 = 30.0;
+pub const MIN_CELL_HEIGHT: f32 = 20.0;
+pub const RESIZE_HANDLE_WIDTH: f32 = 5.0;
 pub const ROW_HEADER_WIDTH: f32 = 50.0;
 pub const COLUMN_HEADER_HEIGHT: f32 = 24.0;
 pub const HEADER_HEIGHT: f32 = 32.0;
@@ -19,8 +24,33 @@ pub const FOOTER_HEIGHT: f32 = 24.0;
 
 // Minimum window size: enough for header + column headers + 1 cell row + footer (height)
 // and row header + 1 cell column (width)
-pub const MIN_WINDOW_WIDTH: f32 = ROW_HEADER_WIDTH + CELL_WIDTH;
-pub const MIN_WINDOW_HEIGHT: f32 = HEADER_HEIGHT + COLUMN_HEADER_HEIGHT + CELL_HEIGHT + FOOTER_HEIGHT;
+pub const MIN_WINDOW_WIDTH: f32 = ROW_HEADER_WIDTH + DEFAULT_CELL_WIDTH;
+pub const MIN_WINDOW_HEIGHT: f32 = HEADER_HEIGHT + COLUMN_HEADER_HEIGHT + DEFAULT_CELL_HEIGHT + FOOTER_HEIGHT;
+
+/// Target for resize operation
+#[derive(Clone, Copy, Debug)]
+pub enum ResizeTarget {
+    Column(usize),
+    Row(usize),
+}
+
+/// State for active resize operation
+#[derive(Clone, Copy, Debug)]
+pub struct ResizeState {
+    pub target: ResizeTarget,
+    pub start_mouse_pos: f32,
+    pub original_size: f32,
+}
+
+/// Auto-fit watch mode configuration
+#[derive(Clone, Debug, Default)]
+pub enum AutoFitWatch {
+    #[default]
+    None,
+    All,
+    Columns(HashSet<usize>),
+    Rows(HashSet<usize>),
+}
 
 // Actions for Normal mode
 actions!(
@@ -105,6 +135,11 @@ pub struct SpreadsheetGrid {
     file_state: FileState,
     command_palette: Entity<CommandPalette>,
     show_command_palette: bool,
+    // Resizing support
+    column_widths: Vec<f32>,
+    row_heights: Vec<f32>,
+    resize_state: Option<ResizeState>,
+    autofit_watch: AutoFitWatch,
 }
 
 impl SpreadsheetGrid {
@@ -131,6 +166,10 @@ impl SpreadsheetGrid {
             file_state: FileState::new(),
             command_palette,
             show_command_palette: false,
+            column_widths: vec![DEFAULT_CELL_WIDTH; GRID_COLS],
+            row_heights: vec![DEFAULT_CELL_HEIGHT; GRID_ROWS],
+            resize_state: None,
+            autofit_watch: AutoFitWatch::None,
         }
     }
 
@@ -207,9 +246,14 @@ impl SpreadsheetGrid {
         // Save the content from the input back to the cell
         let content = self.active_input.read(cx).get_content();
         let old_content = &self.cells[self.selected.row][self.selected.col];
-        if &content != old_content {
+        let content_changed = &content != old_content;
+        if content_changed {
             self.cells[self.selected.row][self.selected.col] = content;
             self.file_state.mark_dirty();
+            // Check if auto-fit watch mode should resize this cell
+            let row = self.selected.row;
+            let col = self.selected.col;
+            self.check_autofit_watch(row, col, cx);
         }
 
         self.mode = Mode::Normal;
@@ -226,6 +270,10 @@ impl SpreadsheetGrid {
         self.selected = CellPosition::new(0, 0);
         self.scroll_row = 0;
         self.scroll_col = 0;
+        // Reset dimensions to defaults
+        self.column_widths = vec![DEFAULT_CELL_WIDTH; GRID_COLS];
+        self.row_heights = vec![DEFAULT_CELL_HEIGHT; GRID_ROWS];
+        self.autofit_watch = AutoFitWatch::None;
         self.file_state = FileState::new();
         self.focus_handle.focus(window, cx);
         cx.notify();
@@ -255,9 +303,24 @@ impl SpreadsheetGrid {
                 self.selected = CellPosition::new(0, 0);
                 self.scroll_row = 0;
                 self.scroll_col = 0;
+
+                // Load metadata (column widths, row heights)
+                match SpreadsheetMetadata::load(&path) {
+                    Ok(metadata) => {
+                        self.column_widths = metadata.get_column_widths();
+                        self.row_heights = metadata.get_row_heights();
+                    }
+                    Err(_) => {
+                        // Reset to defaults if metadata can't be loaded
+                        self.column_widths = vec![DEFAULT_CELL_WIDTH; GRID_COLS];
+                        self.row_heights = vec![DEFAULT_CELL_HEIGHT; GRID_ROWS];
+                    }
+                }
+
                 self.file_state = FileState::new();
                 self.file_state.set_path(path);
                 self.file_state.set_read_only(read_only);
+                self.autofit_watch = AutoFitWatch::None;
                 cx.notify();
             }
             Err(e) => {
@@ -309,6 +372,15 @@ impl SpreadsheetGrid {
     fn save_to_path(&mut self, path: &PathBuf, cx: &mut Context<Self>) {
         match file_io::write_csv(path, &self.cells) {
             Ok(()) => {
+                // Save metadata (column widths, row heights)
+                let metadata = SpreadsheetMetadata {
+                    column_widths: Some(self.column_widths.clone()),
+                    row_heights: Some(self.row_heights.clone()),
+                };
+                if let Err(e) = metadata.save(path) {
+                    eprintln!("Warning: Failed to save metadata: {}", e);
+                }
+
                 self.file_state.mark_clean();
                 self.file_state.set_path(path.clone());
                 cx.notify();
@@ -386,6 +458,14 @@ impl SpreadsheetGrid {
                     self.file_state.set_path(path);
                 }
                 VimCommand::New => self.new_file(&NewFile, window, cx),
+                // Auto-fit commands
+                VimCommand::AutoFitAll => self.auto_fit_all(cx),
+                VimCommand::AutoFitColumn => self.auto_fit_column(self.selected.col, cx),
+                VimCommand::AutoFitRow => self.auto_fit_row(self.selected.row, cx),
+                VimCommand::AutoFitWatch => self.toggle_autofit_watch_all(cx),
+                VimCommand::AutoFitColumnWatch => self.toggle_autofit_watch_column(self.selected.col, cx),
+                VimCommand::AutoFitRowWatch => self.toggle_autofit_watch_row(self.selected.row, cx),
+                VimCommand::ResetAllSizes => self.reset_all_sizes(cx),
             }
             cx.notify();
             return;
@@ -401,6 +481,12 @@ impl SpreadsheetGrid {
             "close_file" => self.close_file(&CloseFile, window, cx),
             "quit" => cx.quit(),
             "toggle_read_only" => self.toggle_read_only(&ToggleReadOnly, window, cx),
+            // Auto-fit commands
+            "autofit_all" => self.auto_fit_all(cx),
+            "autofit_column" => self.auto_fit_column(self.selected.col, cx),
+            "autofit_row" => self.auto_fit_row(self.selected.row, cx),
+            "autofit_watch" => self.toggle_autofit_watch_all(cx),
+            "reset_sizes" => self.reset_all_sizes(cx),
             _ => {}
         }
         cx.notify();
@@ -419,6 +505,309 @@ impl SpreadsheetGrid {
             self.scroll_col = self.selected.col;
         } else if self.selected.col >= self.scroll_col + self.visible_cols {
             self.scroll_col = self.selected.col.saturating_sub(self.visible_cols - 1);
+        }
+    }
+
+    /// Calculate number of visible rows from scroll position that fit in given height
+    fn calculate_visible_rows(&self, available_height: f32) -> usize {
+        let mut total_height = 0.0;
+        let mut count = 0;
+        for row in self.scroll_row..GRID_ROWS {
+            total_height += self.row_heights[row];
+            count += 1;
+            if total_height >= available_height {
+                break;
+            }
+        }
+        count.max(1)
+    }
+
+    /// Calculate number of visible columns from scroll position that fit in given width
+    fn calculate_visible_cols(&self, available_width: f32) -> usize {
+        let mut total_width = 0.0;
+        let mut count = 0;
+        for col in self.scroll_col..GRID_COLS {
+            total_width += self.column_widths[col];
+            count += 1;
+            if total_width >= available_width {
+                break;
+            }
+        }
+        count.max(1)
+    }
+
+    // === Resize handle detection helpers ===
+
+    /// Get the X position where a column ends (relative to grid area, after row header)
+    fn column_end_x(&self, col: usize) -> f32 {
+        self.column_widths[self.scroll_col..=col].iter().sum()
+    }
+
+    /// Get the Y position where a row ends (relative to grid area, after column header)
+    fn row_end_y(&self, row: usize) -> f32 {
+        self.row_heights[self.scroll_row..=row].iter().sum()
+    }
+
+    /// Find if x position is near a column resize border, returns the column index whose right edge is near
+    fn column_resize_target(&self, x: f32) -> Option<usize> {
+        let end_col = (self.scroll_col + self.visible_cols).min(GRID_COLS);
+        for col in self.scroll_col..end_col {
+            let col_end = self.column_end_x(col);
+            if (x - col_end).abs() <= RESIZE_HANDLE_WIDTH {
+                return Some(col);
+            }
+        }
+        None
+    }
+
+    /// Find if y position is near a row resize border, returns the row index whose bottom edge is near
+    fn row_resize_target(&self, y: f32) -> Option<usize> {
+        let end_row = (self.scroll_row + self.visible_rows).min(GRID_ROWS);
+        for row in self.scroll_row..end_row {
+            let row_end = self.row_end_y(row);
+            if (y - row_end).abs() <= RESIZE_HANDLE_WIDTH {
+                return Some(row);
+            }
+        }
+        None
+    }
+
+    // === Resize operations ===
+
+    /// Start a column resize operation
+    fn start_column_resize(&mut self, col: usize, mouse_x: f32, _cx: &mut Context<Self>) {
+        self.resize_state = Some(ResizeState {
+            target: ResizeTarget::Column(col),
+            start_mouse_pos: mouse_x,
+            original_size: self.column_widths[col],
+        });
+    }
+
+    /// Start a row resize operation
+    fn start_row_resize(&mut self, row: usize, mouse_y: f32, _cx: &mut Context<Self>) {
+        self.resize_state = Some(ResizeState {
+            target: ResizeTarget::Row(row),
+            start_mouse_pos: mouse_y,
+            original_size: self.row_heights[row],
+        });
+    }
+
+    /// Update size during resize drag
+    fn update_resize(&mut self, current_pos: f32, cx: &mut Context<Self>) {
+        if let Some(state) = &self.resize_state {
+            let delta = current_pos - state.start_mouse_pos;
+            let new_size = (state.original_size + delta).max(MIN_CELL_WIDTH);
+
+            match state.target {
+                ResizeTarget::Column(col) => {
+                    self.column_widths[col] = new_size.max(MIN_CELL_WIDTH);
+                }
+                ResizeTarget::Row(row) => {
+                    self.row_heights[row] = new_size.max(MIN_CELL_HEIGHT);
+                }
+            }
+            cx.notify();
+        }
+    }
+
+    /// End resize operation
+    fn end_resize(&mut self, cx: &mut Context<Self>) {
+        self.resize_state = None;
+        self.file_state.mark_dirty();
+        cx.notify();
+    }
+
+    /// Handle column header mouse down - start resize or double-click auto-fit
+    fn on_column_header_mouse_down(&mut self, event: &MouseDownEvent, header_x: f32, cx: &mut Context<Self>) {
+        // x position relative to column header area (after row header)
+        let x = f32::from(event.position.x) - ROW_HEADER_WIDTH - header_x;
+
+        if let Some(col) = self.column_resize_target(x) {
+            if event.click_count == 2 {
+                // Double-click: auto-fit column
+                self.auto_fit_column(col, cx);
+            } else {
+                // Single click: start resize
+                self.start_column_resize(col, f32::from(event.position.x), cx);
+            }
+        }
+    }
+
+    /// Handle row header mouse down - start resize or double-click auto-fit
+    fn on_row_header_mouse_down(&mut self, event: &MouseDownEvent, header_y: f32, cx: &mut Context<Self>) {
+        // y position relative to row area (after column header)
+        let y = f32::from(event.position.y) - COLUMN_HEADER_HEIGHT - HEADER_HEIGHT - header_y;
+
+        if let Some(row) = self.row_resize_target(y) {
+            if event.click_count == 2 {
+                // Double-click: auto-fit row
+                self.auto_fit_row(row, cx);
+            } else {
+                // Single click: start resize
+                self.start_row_resize(row, f32::from(event.position.y), cx);
+            }
+        }
+    }
+
+    // === Auto-fit methods (implemented in Phase 5) ===
+
+    /// Auto-fit a column width to its content
+    fn auto_fit_column(&mut self, col: usize, cx: &mut Context<Self>) {
+        // Find the maximum content width in this column
+        let mut max_width = DEFAULT_CELL_WIDTH;
+        for row in 0..GRID_ROWS {
+            let content = &self.cells[row][col];
+            if !content.is_empty() {
+                // Estimate width: approximately 8 pixels per character + padding
+                let estimated_width = content.len() as f32 * 8.0 + 16.0;
+                max_width = max_width.max(estimated_width);
+            }
+        }
+        self.column_widths[col] = max_width.max(DEFAULT_CELL_WIDTH);
+        self.file_state.mark_dirty();
+        cx.notify();
+    }
+
+    /// Auto-fit a row height to its content
+    fn auto_fit_row(&mut self, row: usize, cx: &mut Context<Self>) {
+        // For now, use default height. Multiline support will improve this.
+        let mut max_height = DEFAULT_CELL_HEIGHT;
+        for col in 0..GRID_COLS {
+            let content = &self.cells[row][col];
+            if !content.is_empty() {
+                // Count newlines to determine height
+                let line_count = content.lines().count().max(1);
+                let estimated_height = line_count as f32 * 20.0 + 8.0;
+                max_height = max_height.max(estimated_height);
+            }
+        }
+        self.row_heights[row] = max_height.max(DEFAULT_CELL_HEIGHT);
+        self.file_state.mark_dirty();
+        cx.notify();
+    }
+
+    /// Auto-fit all columns and rows
+    fn auto_fit_all(&mut self, cx: &mut Context<Self>) {
+        for col in 0..GRID_COLS {
+            let mut max_width = DEFAULT_CELL_WIDTH;
+            for row in 0..GRID_ROWS {
+                let content = &self.cells[row][col];
+                if !content.is_empty() {
+                    let estimated_width = content.len() as f32 * 8.0 + 16.0;
+                    max_width = max_width.max(estimated_width);
+                }
+            }
+            self.column_widths[col] = max_width.max(DEFAULT_CELL_WIDTH);
+        }
+        for row in 0..GRID_ROWS {
+            let mut max_height = DEFAULT_CELL_HEIGHT;
+            for col in 0..GRID_COLS {
+                let content = &self.cells[row][col];
+                if !content.is_empty() {
+                    let line_count = content.lines().count().max(1);
+                    let estimated_height = line_count as f32 * 20.0 + 8.0;
+                    max_height = max_height.max(estimated_height);
+                }
+            }
+            self.row_heights[row] = max_height.max(DEFAULT_CELL_HEIGHT);
+        }
+        self.file_state.mark_dirty();
+        cx.notify();
+    }
+
+    /// Reset all column widths and row heights to defaults
+    fn reset_all_sizes(&mut self, cx: &mut Context<Self>) {
+        self.column_widths = vec![DEFAULT_CELL_WIDTH; GRID_COLS];
+        self.row_heights = vec![DEFAULT_CELL_HEIGHT; GRID_ROWS];
+        self.file_state.mark_dirty();
+        cx.notify();
+    }
+
+    // === Watch mode methods ===
+
+    /// Toggle auto-fit watch mode for all cells
+    fn toggle_autofit_watch_all(&mut self, cx: &mut Context<Self>) {
+        self.autofit_watch = match &self.autofit_watch {
+            AutoFitWatch::All => AutoFitWatch::None,
+            _ => AutoFitWatch::All,
+        };
+        cx.notify();
+    }
+
+    /// Toggle auto-fit watch for a specific column
+    fn toggle_autofit_watch_column(&mut self, col: usize, cx: &mut Context<Self>) {
+        match &mut self.autofit_watch {
+            AutoFitWatch::Columns(cols) => {
+                if cols.contains(&col) {
+                    cols.remove(&col);
+                    if cols.is_empty() {
+                        self.autofit_watch = AutoFitWatch::None;
+                    }
+                } else {
+                    cols.insert(col);
+                }
+            }
+            AutoFitWatch::None => {
+                let mut cols = HashSet::new();
+                cols.insert(col);
+                self.autofit_watch = AutoFitWatch::Columns(cols);
+            }
+            _ => {
+                // If All or Rows mode, switch to just this column
+                let mut cols = HashSet::new();
+                cols.insert(col);
+                self.autofit_watch = AutoFitWatch::Columns(cols);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Toggle auto-fit watch for a specific row
+    fn toggle_autofit_watch_row(&mut self, row: usize, cx: &mut Context<Self>) {
+        match &mut self.autofit_watch {
+            AutoFitWatch::Rows(rows) => {
+                if rows.contains(&row) {
+                    rows.remove(&row);
+                    if rows.is_empty() {
+                        self.autofit_watch = AutoFitWatch::None;
+                    }
+                } else {
+                    rows.insert(row);
+                }
+            }
+            AutoFitWatch::None => {
+                let mut rows = HashSet::new();
+                rows.insert(row);
+                self.autofit_watch = AutoFitWatch::Rows(rows);
+            }
+            _ => {
+                // If All or Columns mode, switch to just this row
+                let mut rows = HashSet::new();
+                rows.insert(row);
+                self.autofit_watch = AutoFitWatch::Rows(rows);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Check if auto-fit should be applied for a cell, and apply it
+    fn check_autofit_watch(&mut self, row: usize, col: usize, cx: &mut Context<Self>) {
+        match &self.autofit_watch {
+            AutoFitWatch::None => {}
+            AutoFitWatch::All => {
+                self.auto_fit_column(col, cx);
+                self.auto_fit_row(row, cx);
+            }
+            AutoFitWatch::Columns(cols) => {
+                if cols.contains(&col) {
+                    self.auto_fit_column(col, cx);
+                }
+            }
+            AutoFitWatch::Rows(rows) => {
+                if rows.contains(&row) {
+                    self.auto_fit_row(row, cx);
+                }
+            }
         }
     }
 
@@ -501,15 +890,47 @@ impl SpreadsheetGrid {
 
     fn render_column_headers(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.global::<Theme>();
+        let entity = cx.entity().clone();
         let end_col = (self.scroll_col + self.visible_cols).min(GRID_COLS);
+        let column_widths = self.column_widths.clone();
+        let selected_col = self.selected.col;
 
         div()
+            .id("column-headers")
             .flex()
             .flex_row()
             .h(px(COLUMN_HEADER_HEIGHT))
             .bg(theme.mantle)
             .border_b_1()
             .border_color(theme.surface0)
+            .on_mouse_down(MouseButton::Left, {
+                let entity = entity.clone();
+                move |event, _window, app| {
+                    entity.update(app, |grid, cx| {
+                        grid.on_column_header_mouse_down(event, 0.0, cx);
+                    });
+                }
+            })
+            .on_mouse_move({
+                let entity = entity.clone();
+                move |event, _window, app| {
+                    entity.update(app, |grid, cx| {
+                        if grid.resize_state.is_some() {
+                            grid.update_resize(f32::from(event.position.x), cx);
+                        }
+                    });
+                }
+            })
+            .on_mouse_up(MouseButton::Left, {
+                let entity = entity.clone();
+                move |_event, _window, app| {
+                    entity.update(app, |grid, cx| {
+                        if grid.resize_state.is_some() {
+                            grid.end_resize(cx);
+                        }
+                    });
+                }
+            })
             .child(
                 // Empty corner cell
                 div()
@@ -520,13 +941,14 @@ impl SpreadsheetGrid {
                     .border_color(theme.surface0)
             )
             .children(
-                (self.scroll_col..end_col).map(|col| {
+                (self.scroll_col..end_col).map(move |col| {
                     let col_letter = CellPosition::new(0, col).to_reference();
                     let col_letter: String = col_letter.chars().take_while(|c| c.is_alphabetic()).collect();
-                    let is_selected = col == self.selected.col;
+                    let is_selected = col == selected_col;
+                    let col_width = column_widths[col];
 
                     div()
-                        .w(px(CELL_WIDTH))
+                        .w(px(col_width))
                         .h_full()
                         .flex_none()
                         .flex()
@@ -544,25 +966,68 @@ impl SpreadsheetGrid {
 
     fn render_grid(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.global::<Theme>();
+        let entity = cx.entity().clone();
         let end_row = (self.scroll_row + self.visible_rows).min(GRID_ROWS);
         let end_col = (self.scroll_col + self.visible_cols).min(GRID_COLS);
+        let column_widths = self.column_widths.clone();
+        let row_heights = self.row_heights.clone();
+        let cells = self.cells.clone();
+        let selected = self.selected;
+        let mode = self.mode;
+        let active_input = self.active_input.clone();
+        let scroll_col = self.scroll_col;
 
         div()
+            .id("grid-area")
             .flex()
             .flex_col()
             .flex_1()
             .overflow_hidden()
+            .on_mouse_move({
+                let entity = entity.clone();
+                move |event, _window, app| {
+                    entity.update(app, |grid, cx| {
+                        if grid.resize_state.is_some() {
+                            match grid.resize_state.as_ref().unwrap().target {
+                                ResizeTarget::Column(_) => {
+                                    grid.update_resize(f32::from(event.position.x), cx);
+                                }
+                                ResizeTarget::Row(_) => {
+                                    grid.update_resize(f32::from(event.position.y), cx);
+                                }
+                            }
+                        }
+                    });
+                }
+            })
+            .on_mouse_up(MouseButton::Left, {
+                let entity = entity.clone();
+                move |_event, _window, app| {
+                    entity.update(app, |grid, cx| {
+                        if grid.resize_state.is_some() {
+                            grid.end_resize(cx);
+                        }
+                    });
+                }
+            })
             .children(
-                (self.scroll_row..end_row).map(|row| {
-                    let is_row_selected = row == self.selected.row;
+                (self.scroll_row..end_row).map(move |row| {
+                    let is_row_selected = row == selected.row;
+                    let row_height = row_heights[row];
+                    let column_widths = column_widths.clone();
+                    let cells = cells.clone();
+                    let entity = entity.clone();
+                    let active_input = active_input.clone();
 
                     div()
                         .flex()
                         .flex_row()
-                        .h(px(CELL_HEIGHT))
-                        .child(
-                            // Row header
+                        .h(px(row_height))
+                        .child({
+                            // Row header with resize handling
+                            let entity = entity.clone();
                             div()
+                                .id(ElementId::Name(format!("row-header-{}", row).into()))
                                 .w(px(ROW_HEADER_WIDTH))
                                 .h_full()
                                 .flex_none()
@@ -576,35 +1041,45 @@ impl SpreadsheetGrid {
                                 .text_size(px(12.))
                                 .text_color(if is_row_selected { theme.accent } else { theme.subtext0 })
                                 .font_weight(if is_row_selected { FontWeight::BOLD } else { FontWeight::NORMAL })
+                                .on_mouse_down(MouseButton::Left, {
+                                    move |event, _window, app| {
+                                        entity.update(app, |grid, cx| {
+                                            grid.on_row_header_mouse_down(event, 0.0, cx);
+                                        });
+                                    }
+                                })
                                 .child(format!("{}", row + 1))
-                        )
+                        })
                         .children(
-                            (self.scroll_col..end_col).map(|col| {
-                                let is_selected = row == self.selected.row && col == self.selected.col;
-                                let content = self.cells[row][col].clone();
+                            (scroll_col..end_col).map(move |col| {
+                                let is_selected = row == selected.row && col == selected.col;
+                                let content = cells[row][col].clone();
+                                let col_width = column_widths[col];
+                                let entity = entity.clone();
 
-                                if is_selected && self.mode == Mode::Edit {
+                                if is_selected && mode == Mode::Edit {
                                     // Render the active input for selected cell in edit mode
                                     div()
                                         .id(ElementId::Name(format!("cell-edit-{}-{}", row, col).into()))
-                                        .w(px(CELL_WIDTH))
-                                        .h(px(CELL_HEIGHT))
+                                        .w(px(col_width))
+                                        .h(px(row_height))
                                         .flex_none()
                                         .border_2()
                                         .border_color(theme.accent)
                                         .overflow_hidden()
-                                        .child(self.active_input.clone())
+                                        .child(active_input.clone())
                                 } else {
-                                    // Render static cell
-                                    let row = row;
-                                    let col = col;
+                                    // Render static cell with multiline support
+                                    let has_newlines = content.contains('\n');
                                     div()
                                         .id(ElementId::Name(format!("cell-{}-{}", row, col).into()))
-                                        .w(px(CELL_WIDTH))
-                                        .h(px(CELL_HEIGHT))
+                                        .w(px(col_width))
+                                        .h(px(row_height))
                                         .flex_none()
                                         .flex()
-                                        .items_center()
+                                        .flex_col()
+                                        .when(!has_newlines, |d| d.items_center().justify_center())
+                                        .when(has_newlines, |d| d.items_start().pt(px(2.)))
                                         .px(px(4.))
                                         .border_r_1()
                                         .border_b_1()
@@ -614,7 +1089,6 @@ impl SpreadsheetGrid {
                                         .text_size(px(14.))
                                         .overflow_hidden()
                                         .on_mouse_down(MouseButton::Left, {
-                                            let entity = cx.entity().clone();
                                             move |event, window, app| {
                                                 if event.click_count == 2 {
                                                     entity.update(app, |this, cx| {
@@ -627,7 +1101,15 @@ impl SpreadsheetGrid {
                                                 }
                                             }
                                         })
-                                        .child(content)
+                                        .when(!has_newlines, |d| d.child(content.clone()))
+                                        .when(has_newlines, |d| {
+                                            d.children(content.lines().map(|line| {
+                                                div()
+                                                    .w_full()
+                                                    .line_height(px(18.))
+                                                    .child(line.to_string())
+                                            }))
+                                        })
                                 }
                             })
                         )
@@ -691,8 +1173,9 @@ impl Render for SpreadsheetGrid {
         let grid_height = f32::from(content_bounds.height) - HEADER_HEIGHT - COLUMN_HEADER_HEIGHT - FOOTER_HEIGHT;
         let grid_width = f32::from(content_bounds.width) - ROW_HEADER_WIDTH;
 
-        self.visible_rows = ((grid_height / CELL_HEIGHT).ceil() as usize).max(1);
-        self.visible_cols = ((grid_width / CELL_WIDTH).ceil() as usize).max(1);
+        // Calculate visible rows by summing row heights from scroll position
+        self.visible_rows = self.calculate_visible_rows(grid_height);
+        self.visible_cols = self.calculate_visible_cols(grid_width);
 
         // Ensure selection is still visible after resize
         self.ensure_visible();
