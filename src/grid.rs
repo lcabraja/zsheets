@@ -14,6 +14,13 @@ pub const CELL_WIDTH: f32 = 100.0;
 pub const CELL_HEIGHT: f32 = 28.0;
 pub const ROW_HEADER_WIDTH: f32 = 50.0;
 pub const COLUMN_HEADER_HEIGHT: f32 = 24.0;
+pub const HEADER_HEIGHT: f32 = 32.0;
+pub const FOOTER_HEIGHT: f32 = 24.0;
+
+// Minimum window size: enough for header + column headers + 1 cell row + footer (height)
+// and row header + 1 cell column (width)
+pub const MIN_WINDOW_WIDTH: f32 = ROW_HEADER_WIDTH + CELL_WIDTH;
+pub const MIN_WINDOW_HEIGHT: f32 = HEADER_HEIGHT + COLUMN_HEADER_HEIGHT + CELL_HEIGHT + FOOTER_HEIGHT;
 
 // Actions for Normal mode
 actions!(
@@ -449,7 +456,7 @@ impl SpreadsheetGrid {
             .flex()
             .flex_row()
             .w_full()
-            .h(px(32.))
+            .h(px(HEADER_HEIGHT))
             .bg(theme.mantle)
             .border_b_1()
             .border_color(theme.surface0)
@@ -508,6 +515,7 @@ impl SpreadsheetGrid {
                 div()
                     .w(px(ROW_HEADER_WIDTH))
                     .h_full()
+                    .flex_none()
                     .border_r_1()
                     .border_color(theme.surface0)
             )
@@ -520,6 +528,7 @@ impl SpreadsheetGrid {
                     div()
                         .w(px(CELL_WIDTH))
                         .h_full()
+                        .flex_none()
                         .flex()
                         .items_center()
                         .justify_center()
@@ -556,6 +565,7 @@ impl SpreadsheetGrid {
                             div()
                                 .w(px(ROW_HEADER_WIDTH))
                                 .h_full()
+                                .flex_none()
                                 .flex()
                                 .items_center()
                                 .justify_center()
@@ -579,6 +589,7 @@ impl SpreadsheetGrid {
                                         .id(ElementId::Name(format!("cell-edit-{}-{}", row, col).into()))
                                         .w(px(CELL_WIDTH))
                                         .h(px(CELL_HEIGHT))
+                                        .flex_none()
                                         .border_2()
                                         .border_color(theme.accent)
                                         .overflow_hidden()
@@ -591,6 +602,7 @@ impl SpreadsheetGrid {
                                         .id(ElementId::Name(format!("cell-{}-{}", row, col).into()))
                                         .w(px(CELL_WIDTH))
                                         .h(px(CELL_HEIGHT))
+                                        .flex_none()
                                         .flex()
                                         .items_center()
                                         .px(px(4.))
@@ -601,7 +613,6 @@ impl SpreadsheetGrid {
                                         .bg(if is_selected { theme.surface0 } else { theme.base })
                                         .text_size(px(14.))
                                         .overflow_hidden()
-                                        .text_ellipsis()
                                         .on_mouse_down(MouseButton::Left, {
                                             let entity = cx.entity().clone();
                                             move |event, window, app| {
@@ -639,7 +650,7 @@ impl SpreadsheetGrid {
             .flex()
             .flex_row()
             .w_full()
-            .h(px(24.))
+            .h(px(FOOTER_HEIGHT))
             .bg(theme.mantle)
             .border_t_1()
             .border_color(theme.surface0)
@@ -677,11 +688,11 @@ impl Render for SpreadsheetGrid {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Calculate visible rows and columns based on window size
         let content_bounds = window.viewport_size();
-        let grid_height = f32::from(content_bounds.height) - 32.0 - COLUMN_HEADER_HEIGHT - 24.0; // header + col headers + footer
+        let grid_height = f32::from(content_bounds.height) - HEADER_HEIGHT - COLUMN_HEADER_HEIGHT - FOOTER_HEIGHT;
         let grid_width = f32::from(content_bounds.width) - ROW_HEADER_WIDTH;
 
-        self.visible_rows = ((grid_height / CELL_HEIGHT).floor() as usize).max(1);
-        self.visible_cols = ((grid_width / CELL_WIDTH).floor() as usize).max(1);
+        self.visible_rows = ((grid_height / CELL_HEIGHT).ceil() as usize).max(1);
+        self.visible_cols = ((grid_width / CELL_WIDTH).ceil() as usize).max(1);
 
         // Ensure selection is still visible after resize
         self.ensure_visible();

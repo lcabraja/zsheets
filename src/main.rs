@@ -101,6 +101,7 @@ fn main() {
                     appears_transparent: false,
                     ..Default::default()
                 }),
+                window_min_size: Some(size(px(MIN_WINDOW_WIDTH), px(MIN_WINDOW_HEIGHT))),
                 ..Default::default()
             };
 

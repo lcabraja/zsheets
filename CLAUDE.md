@@ -2,6 +2,12 @@
 
 A 100x100 cell spreadsheet with vim-style modal editing, built with GPUI.
 
+## After Every Code Change
+
+After making any successful code edit, you MUST:
+1. Run `cargo build` to verify compilation
+2. If build succeeds, run `./build.sh` to build release and deploy to ~/Applications/zsheets.app
+
 ## Build & Run
 
 ```bash
