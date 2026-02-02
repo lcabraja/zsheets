@@ -11,6 +11,8 @@ name = "zsheets"
 gpui = { git = "https://github.com/zed-industries/zed", package = "gpui" }
 rust-embed = "8"
 unicode-segmentation = "1"
+csv = "1.3"
+rfd = "0.15"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-text = "=21.0.0"

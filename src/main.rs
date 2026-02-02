@@ -1,6 +1,10 @@
 mod assets;
 mod cell;
+mod command_palette;
+mod file_io;
+mod file_state;
 mod grid;
+mod menu;
 mod state;
 mod theme;
 
@@ -8,6 +12,7 @@ use gpui::*;
 
 use assets::Assets;
 use cell::*;
+use command_palette::*;
 use grid::*;
 use theme::Theme;
 
@@ -17,6 +22,9 @@ fn main() {
         .run(|cx| {
             // Initialize theme
             Theme::init(cx);
+
+            // Set up menu bar
+            menu::setup_menu(cx);
 
             // Register keybindings
             cx.bind_keys([
@@ -56,6 +64,21 @@ fn main() {
                 KeyBinding::new("cmd-v", Paste, Some("CellInput")),
                 KeyBinding::new("cmd-c", Copy, Some("CellInput")),
                 KeyBinding::new("cmd-x", Cut, Some("CellInput")),
+
+                // Command palette
+                KeyBinding::new("cmd-k", ShowCommandPalette, Some("NormalMode")),
+                KeyBinding::new("shift-;", ShowCommandPalette, Some("NormalMode")), // : key
+                KeyBinding::new("escape", HideCommandPalette, Some("CommandPalette")),
+                KeyBinding::new("up", SelectPrevious, Some("CommandPalette")),
+                KeyBinding::new("down", SelectNext, Some("CommandPalette")),
+                KeyBinding::new("enter", Confirm, Some("CommandPalette")),
+
+                // File operations
+                KeyBinding::new("cmd-n", NewFile, Some("NormalMode")),
+                KeyBinding::new("cmd-o", OpenFile, Some("NormalMode")),
+                KeyBinding::new("cmd-s", SaveFile, Some("NormalMode")),
+                KeyBinding::new("cmd-shift-s", SaveFileAs, Some("NormalMode")),
+                KeyBinding::new("cmd-w", CloseFile, Some("NormalMode")),
 
                 // Global
                 KeyBinding::new("cmd-q", Quit, None),

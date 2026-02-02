@@ -1,7 +1,12 @@
+use std::path::PathBuf;
+
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 
 use crate::cell::CellInput;
+use crate::command_palette::{CommandPalette, HideCommandPalette, ShowCommandPalette, VimCommand};
+use crate::file_io;
+use crate::file_state::FileState;
 use crate::state::{CellPosition, Mode, GRID_COLS, GRID_ROWS};
 use crate::Theme;
 
@@ -36,6 +41,21 @@ actions!(
 
 // Global actions
 actions!(spreadsheet, [Quit]);
+
+// File operation actions
+actions!(
+    file_ops,
+    [
+        NewFile,
+        OpenFile,
+        SaveFile,
+        SaveFileAs,
+        ForceWrite,
+        CloseFile,
+        ToggleReadOnly,
+        ForceQuit,
+    ]
+);
 
 /// The main spreadsheet application component
 pub struct SpreadsheetApp {
@@ -75,12 +95,16 @@ pub struct SpreadsheetGrid {
     mode: Mode,
     visible_rows: usize,
     visible_cols: usize,
+    file_state: FileState,
+    command_palette: Entity<CommandPalette>,
+    show_command_palette: bool,
 }
 
 impl SpreadsheetGrid {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         let active_input = cx.new(|cx| CellInput::new(cx));
+        let command_palette = cx.new(|cx| CommandPalette::new(cx));
 
         // Initialize 100x100 grid with empty strings
         let cells = (0..GRID_ROWS)
@@ -97,6 +121,9 @@ impl SpreadsheetGrid {
             mode: Mode::Normal,
             visible_rows: 20,
             visible_cols: 10,
+            file_state: FileState::new(),
+            command_palette,
+            show_command_palette: false,
         }
     }
 
@@ -172,10 +199,203 @@ impl SpreadsheetGrid {
     fn save_and_exit_edit_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Save the content from the input back to the cell
         let content = self.active_input.read(cx).get_content();
-        self.cells[self.selected.row][self.selected.col] = content;
+        let old_content = &self.cells[self.selected.row][self.selected.col];
+        if &content != old_content {
+            self.cells[self.selected.row][self.selected.col] = content;
+            self.file_state.mark_dirty();
+        }
 
         self.mode = Mode::Normal;
         self.focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    // File operations
+    fn new_file(&mut self, _: &NewFile, window: &mut Window, cx: &mut Context<Self>) {
+        // Reset all cells
+        self.cells = (0..GRID_ROWS)
+            .map(|_| (0..GRID_COLS).map(|_| String::new()).collect())
+            .collect();
+        self.selected = CellPosition::new(0, 0);
+        self.scroll_row = 0;
+        self.scroll_col = 0;
+        self.file_state = FileState::new();
+        self.focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    fn open_file(&mut self, _: &OpenFile, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_file_dialog(false, window, cx);
+    }
+
+    fn open_file_dialog(&mut self, read_only: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let path = rfd::FileDialog::new()
+            .add_filter("CSV", &["csv"])
+            .add_filter("All Files", &["*"])
+            .pick_file();
+
+        if let Some(path) = path {
+            self.load_file(path, read_only, cx);
+        }
+
+        self.focus_handle.focus(window, cx);
+    }
+
+    fn load_file(&mut self, path: PathBuf, read_only: bool, cx: &mut Context<Self>) {
+        match file_io::read_csv(&path) {
+            Ok(cells) => {
+                self.cells = cells;
+                self.selected = CellPosition::new(0, 0);
+                self.scroll_row = 0;
+                self.scroll_col = 0;
+                self.file_state = FileState::new();
+                self.file_state.set_path(path);
+                self.file_state.set_read_only(read_only);
+                cx.notify();
+            }
+            Err(e) => {
+                eprintln!("Failed to open file: {}", e);
+            }
+        }
+    }
+
+    fn save_file(&mut self, _: &SaveFile, window: &mut Window, cx: &mut Context<Self>) {
+        if self.file_state.is_read_only {
+            eprintln!("File is read-only. Use :w! to force write.");
+            return;
+        }
+
+        if let Some(path) = self.file_state.current_path.clone() {
+            self.save_to_path(&path, cx);
+        } else {
+            self.save_file_as(&SaveFileAs, window, cx);
+        }
+    }
+
+    fn save_file_as(&mut self, _: &SaveFileAs, window: &mut Window, cx: &mut Context<Self>) {
+        let path = rfd::FileDialog::new()
+            .add_filter("CSV", &["csv"])
+            .set_file_name("spreadsheet.csv")
+            .save_file();
+
+        if let Some(path) = path {
+            self.save_to_path(&path, cx);
+            self.file_state.set_path(path);
+        }
+
+        self.focus_handle.focus(window, cx);
+    }
+
+    fn force_write(&mut self, _: &ForceWrite, window: &mut Window, cx: &mut Context<Self>) {
+        let was_read_only = self.file_state.is_read_only;
+        self.file_state.set_read_only(false);
+
+        if let Some(path) = self.file_state.current_path.clone() {
+            self.save_to_path(&path, cx);
+        } else {
+            self.save_file_as(&SaveFileAs, window, cx);
+        }
+
+        self.file_state.set_read_only(was_read_only);
+    }
+
+    fn save_to_path(&mut self, path: &PathBuf, cx: &mut Context<Self>) {
+        match file_io::write_csv(path, &self.cells) {
+            Ok(()) => {
+                self.file_state.mark_clean();
+                self.file_state.set_path(path.clone());
+                cx.notify();
+            }
+            Err(e) => {
+                eprintln!("Failed to save file: {}", e);
+            }
+        }
+    }
+
+    fn close_file(&mut self, _: &CloseFile, window: &mut Window, cx: &mut Context<Self>) {
+        if self.file_state.is_dirty {
+            eprintln!("File has unsaved changes. Use :q! to force quit.");
+            return;
+        }
+        self.new_file(&NewFile, window, cx);
+    }
+
+    fn force_quit(&mut self, _: &ForceQuit, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.quit();
+    }
+
+    fn toggle_read_only(&mut self, _: &ToggleReadOnly, _window: &mut Window, cx: &mut Context<Self>) {
+        self.file_state.set_read_only(!self.file_state.is_read_only);
+        cx.notify();
+    }
+
+    // Command palette
+    fn show_command_palette(&mut self, _: &ShowCommandPalette, window: &mut Window, cx: &mut Context<Self>) {
+        // Exit edit mode if active
+        if self.mode == Mode::Edit {
+            self.save_and_exit_edit_mode(window, cx);
+        }
+
+        self.show_command_palette = true;
+        self.command_palette.update(cx, |palette, cx| {
+            palette.reset(cx);
+        });
+
+        let palette_focus = self.command_palette.focus_handle(cx);
+        palette_focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn hide_command_palette(&mut self, _: &HideCommandPalette, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_command_palette = false;
+        self.focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    fn handle_command(&mut self, cmd_id: &str, vim_cmd: Option<VimCommand>, window: &mut Window, cx: &mut Context<Self>) {
+        // Hide palette first
+        self.show_command_palette = false;
+        self.focus_handle.focus(window, cx);
+
+        // Handle vim commands
+        if let Some(vim_cmd) = vim_cmd {
+            match vim_cmd {
+                VimCommand::Write => self.save_file(&SaveFile, window, cx),
+                VimCommand::WriteTo(path) => {
+                    self.save_to_path(&path, cx);
+                    self.file_state.set_path(path);
+                }
+                VimCommand::ForceWrite => self.force_write(&ForceWrite, window, cx),
+                VimCommand::WriteQuit => {
+                    self.save_file(&SaveFile, window, cx);
+                    cx.quit();
+                }
+                VimCommand::Quit => self.close_file(&CloseFile, window, cx),
+                VimCommand::ForceQuit => cx.quit(),
+                VimCommand::Edit(path) => self.load_file(path, false, cx),
+                VimCommand::View(path) => self.load_file(path, true, cx),
+                VimCommand::SaveAs(path) => {
+                    self.save_to_path(&path, cx);
+                    self.file_state.set_path(path);
+                }
+                VimCommand::New => self.new_file(&NewFile, window, cx),
+            }
+            cx.notify();
+            return;
+        }
+
+        // Handle regular commands
+        match cmd_id {
+            "new_file" => self.new_file(&NewFile, window, cx),
+            "open_file" => self.open_file(&OpenFile, window, cx),
+            "save_file" => self.save_file(&SaveFile, window, cx),
+            "save_file_as" => self.save_file_as(&SaveFileAs, window, cx),
+            "force_write" => self.force_write(&ForceWrite, window, cx),
+            "close_file" => self.close_file(&CloseFile, window, cx),
+            "quit" => cx.quit(),
+            "toggle_read_only" => self.toggle_read_only(&ToggleReadOnly, window, cx),
+            _ => {}
+        }
         cx.notify();
     }
 
@@ -411,6 +631,10 @@ impl SpreadsheetGrid {
             Mode::Edit => "-- EDIT --",
         };
 
+        let file_name = self.file_state.file_name();
+        let dirty_indicator = if self.file_state.is_dirty { "[+] " } else { "" };
+        let read_only_indicator = if self.file_state.is_read_only { "[RO] " } else { "" };
+
         div()
             .flex()
             .flex_row()
@@ -420,11 +644,32 @@ impl SpreadsheetGrid {
             .border_t_1()
             .border_color(theme.surface0)
             .items_center()
+            .justify_between()
             .px(px(8.))
             .text_size(px(12.))
             .text_color(theme.subtext0)
-            .font_weight(FontWeight::BOLD)
-            .child(mode_text)
+            .child(
+                div()
+                    .font_weight(FontWeight::BOLD)
+                    .child(mode_text)
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .when(self.file_state.is_read_only, |d| d.text_color(theme.overlay1))
+                            .child(read_only_indicator)
+                    )
+                    .child(
+                        div()
+                            .when(self.file_state.is_dirty, |d| d.text_color(theme.accent))
+                            .child(dirty_indicator)
+                    )
+                    .child(file_name)
+            )
     }
 }
 
@@ -441,7 +686,25 @@ impl Render for SpreadsheetGrid {
         // Ensure selection is still visible after resize
         self.ensure_visible();
 
-        let key_context = if self.mode == Mode::Edit { "EditMode" } else { "NormalMode" };
+        let key_context = if self.show_command_palette {
+            "CommandPalette"
+        } else if self.mode == Mode::Edit {
+            "EditMode"
+        } else {
+            "NormalMode"
+        };
+
+        // Set up command handler for the palette
+        let entity = cx.entity().clone();
+        self.command_palette.update(cx, |palette, _cx| {
+            palette.set_command_handler(move |cmd_id, vim_cmd, window, app| {
+                entity.update(app, |grid, cx| {
+                    grid.handle_command(cmd_id, vim_cmd, window, cx);
+                });
+            });
+        });
+
+        let show_palette = self.show_command_palette;
 
         div()
             .flex()
@@ -461,10 +724,52 @@ impl Render for SpreadsheetGrid {
             .on_action(cx.listener(Self::exit_and_move_down))
             .on_action(cx.listener(Self::exit_and_move_left))
             .on_action(cx.listener(Self::exit_and_move_right))
+            // File actions
+            .on_action(cx.listener(Self::new_file))
+            .on_action(cx.listener(Self::open_file))
+            .on_action(cx.listener(Self::save_file))
+            .on_action(cx.listener(Self::save_file_as))
+            .on_action(cx.listener(Self::force_write))
+            .on_action(cx.listener(Self::close_file))
+            .on_action(cx.listener(Self::force_quit))
+            .on_action(cx.listener(Self::toggle_read_only))
+            // Command palette actions
+            .on_action(cx.listener(Self::show_command_palette))
+            .on_action(cx.listener(Self::hide_command_palette))
             .child(self.render_header(cx))
             .child(self.render_column_headers(cx))
             .child(self.render_grid(cx))
             .child(self.render_footer(cx))
+            // Command palette overlay
+            .when(show_palette, |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .size_full()
+                        .top_0()
+                        .left_0()
+                        .flex()
+                        .items_start()
+                        .justify_center()
+                        .pt(px(100.))
+                        .bg(rgba(0x00000080))
+                        .on_mouse_down(MouseButton::Left, {
+                            let entity = cx.entity().clone();
+                            move |_, window, app| {
+                                entity.update(app, |grid, cx| {
+                                    grid.hide_command_palette(&HideCommandPalette, window, cx);
+                                });
+                            }
+                        })
+                        .child(
+                            div()
+                                .on_mouse_down(MouseButton::Left, |_, _, _| {
+                                    // Prevent click from bubbling to backdrop
+                                })
+                                .child(self.command_palette.clone())
+                        )
+                )
+            })
     }
 }
 
