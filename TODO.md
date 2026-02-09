@@ -14,4 +14,4 @@
 
 ## Missing Features
 
-- [ ] Add scroll support (mouse wheel, trackpad)
+- [x] Add scroll support (mouse wheel, trackpad)

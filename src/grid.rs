@@ -135,6 +135,9 @@ pub struct SpreadsheetGrid {
     file_state: FileState,
     command_palette: Entity<CommandPalette>,
     show_command_palette: bool,
+    // Scroll pixel offsets for smooth scrolling
+    scroll_offset_x: f32,
+    scroll_offset_y: f32,
     // Resizing support
     column_widths: Vec<f32>,
     row_heights: Vec<f32>,
@@ -160,6 +163,8 @@ impl SpreadsheetGrid {
             selected: CellPosition::new(0, 0),
             scroll_row: 0,
             scroll_col: 0,
+            scroll_offset_x: 0.0,
+            scroll_offset_y: 0.0,
             mode: Mode::Normal,
             visible_rows: 20,
             visible_cols: 10,
@@ -270,6 +275,8 @@ impl SpreadsheetGrid {
         self.selected = CellPosition::new(0, 0);
         self.scroll_row = 0;
         self.scroll_col = 0;
+        self.scroll_offset_x = 0.0;
+        self.scroll_offset_y = 0.0;
         // Reset dimensions to defaults
         self.column_widths = vec![DEFAULT_CELL_WIDTH; GRID_COLS];
         self.row_heights = vec![DEFAULT_CELL_HEIGHT; GRID_ROWS];
@@ -303,6 +310,8 @@ impl SpreadsheetGrid {
                 self.selected = CellPosition::new(0, 0);
                 self.scroll_row = 0;
                 self.scroll_col = 0;
+                self.scroll_offset_x = 0.0;
+                self.scroll_offset_y = 0.0;
 
                 // Load metadata (column widths, row heights)
                 match SpreadsheetMetadata::load(&path) {
@@ -493,18 +502,34 @@ impl SpreadsheetGrid {
     }
 
     fn ensure_visible(&mut self) {
+        let mut scrolled = false;
+
         // Vertical scrolling
-        if self.selected.row < self.scroll_row {
+        if self.selected.row < self.scroll_row
+            || (self.selected.row == self.scroll_row && self.scroll_offset_y > 0.0)
+        {
             self.scroll_row = self.selected.row;
+            scrolled = true;
         } else if self.selected.row >= self.scroll_row + self.visible_rows {
             self.scroll_row = self.selected.row.saturating_sub(self.visible_rows - 1);
+            scrolled = true;
         }
 
         // Horizontal scrolling
-        if self.selected.col < self.scroll_col {
+        if self.selected.col < self.scroll_col
+            || (self.selected.col == self.scroll_col && self.scroll_offset_x > 0.0)
+        {
             self.scroll_col = self.selected.col;
+            scrolled = true;
         } else if self.selected.col >= self.scroll_col + self.visible_cols {
             self.scroll_col = self.selected.col.saturating_sub(self.visible_cols - 1);
+            scrolled = true;
+        }
+
+        // Reset pixel offsets when keyboard navigation causes scrolling
+        if scrolled {
+            self.scroll_offset_x = 0.0;
+            self.scroll_offset_y = 0.0;
         }
     }
 
@@ -513,7 +538,10 @@ impl SpreadsheetGrid {
         let mut total_height = 0.0;
         let mut count = 0;
         for row in self.scroll_row..GRID_ROWS {
-            total_height += self.row_heights[row];
+            let row_h = self.row_heights[row];
+            // First row is partially hidden by scroll_offset_y
+            let visible_h = if count == 0 { row_h - self.scroll_offset_y } else { row_h };
+            total_height += visible_h;
             count += 1;
             if total_height >= available_height {
                 break;
@@ -527,7 +555,10 @@ impl SpreadsheetGrid {
         let mut total_width = 0.0;
         let mut count = 0;
         for col in self.scroll_col..GRID_COLS {
-            total_width += self.column_widths[col];
+            let col_w = self.column_widths[col];
+            // First column is partially hidden by scroll_offset_x
+            let visible_w = if count == 0 { col_w - self.scroll_offset_x } else { col_w };
+            total_width += visible_w;
             count += 1;
             if total_width >= available_width {
                 break;
@@ -540,12 +571,14 @@ impl SpreadsheetGrid {
 
     /// Get the X position where a column ends (relative to grid area, after row header)
     fn column_end_x(&self, col: usize) -> f32 {
-        self.column_widths[self.scroll_col..=col].iter().sum()
+        let sum: f32 = self.column_widths[self.scroll_col..=col].iter().sum();
+        sum - self.scroll_offset_x
     }
 
     /// Get the Y position where a row ends (relative to grid area, after column header)
     fn row_end_y(&self, row: usize) -> f32 {
-        self.row_heights[self.scroll_row..=row].iter().sum()
+        let sum: f32 = self.row_heights[self.scroll_row..=row].iter().sum();
+        sum - self.scroll_offset_y
     }
 
     /// Find if x position is near a column resize border, returns the column index whose right edge is near
@@ -811,6 +844,90 @@ impl SpreadsheetGrid {
         }
     }
 
+    // === Scroll wheel / trackpad ===
+
+    fn handle_scroll_wheel(&mut self, event: &ScrollWheelEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        match event.delta {
+            ScrollDelta::Lines(delta) => {
+                // Mouse wheel: jump by whole cells
+                self.scroll_offset_x = 0.0;
+                self.scroll_offset_y = 0.0;
+
+                let row_delta = -delta.y.round() as isize;
+                let col_delta = -delta.x.round() as isize;
+
+                self.scroll_row = (self.scroll_row as isize + row_delta)
+                    .max(0)
+                    .min((GRID_ROWS - 1) as isize) as usize;
+                self.scroll_col = (self.scroll_col as isize + col_delta)
+                    .max(0)
+                    .min((GRID_COLS - 1) as isize) as usize;
+            }
+            ScrollDelta::Pixels(delta) => {
+                // Trackpad: smooth pixel scrolling
+                self.apply_smooth_scroll(f32::from(-delta.x), f32::from(-delta.y));
+            }
+        }
+        cx.notify();
+    }
+
+    fn apply_smooth_scroll(&mut self, dx: f32, dy: f32) {
+        // Accumulate vertical offset
+        self.scroll_offset_y += dy;
+
+        // Carry over to next/previous rows
+        while self.scroll_offset_y >= self.row_heights[self.scroll_row]
+            && self.scroll_row < GRID_ROWS - 1
+        {
+            self.scroll_offset_y -= self.row_heights[self.scroll_row];
+            self.scroll_row += 1;
+        }
+        while self.scroll_offset_y < 0.0 && self.scroll_row > 0 {
+            self.scroll_row -= 1;
+            self.scroll_offset_y += self.row_heights[self.scroll_row];
+        }
+
+        // Accumulate horizontal offset
+        self.scroll_offset_x += dx;
+
+        // Carry over to next/previous columns
+        while self.scroll_offset_x >= self.column_widths[self.scroll_col]
+            && self.scroll_col < GRID_COLS - 1
+        {
+            self.scroll_offset_x -= self.column_widths[self.scroll_col];
+            self.scroll_col += 1;
+        }
+        while self.scroll_offset_x < 0.0 && self.scroll_col > 0 {
+            self.scroll_col -= 1;
+            self.scroll_offset_x += self.column_widths[self.scroll_col];
+        }
+
+        self.clamp_scroll_position();
+    }
+
+    fn clamp_scroll_position(&mut self) {
+        // Clamp at top/left edges
+        if self.scroll_row == 0 && self.scroll_offset_y < 0.0 {
+            self.scroll_offset_y = 0.0;
+        }
+        if self.scroll_col == 0 && self.scroll_offset_x < 0.0 {
+            self.scroll_offset_x = 0.0;
+        }
+        // Clamp at bottom/right edges
+        if self.scroll_row >= GRID_ROWS - 1 {
+            self.scroll_row = GRID_ROWS - 1;
+            if self.scroll_offset_y > 0.0 {
+                self.scroll_offset_y = 0.0;
+            }
+        }
+        if self.scroll_col >= GRID_COLS - 1 {
+            self.scroll_col = GRID_COLS - 1;
+            if self.scroll_offset_x > 0.0 {
+                self.scroll_offset_x = 0.0;
+            }
+        }
+    }
+
     fn on_cell_click(&mut self, row: usize, col: usize, window: &mut Window, cx: &mut Context<Self>) {
         // If clicking on a different cell while in edit mode, save and exit first
         if self.mode == Mode::Edit && (row != self.selected.row || col != self.selected.col) {
@@ -894,6 +1011,7 @@ impl SpreadsheetGrid {
         let end_col = (self.scroll_col + self.visible_cols).min(GRID_COLS);
         let column_widths = self.column_widths.clone();
         let selected_col = self.selected.col;
+        let offset_x = self.scroll_offset_x;
 
         div()
             .id("column-headers")
@@ -940,27 +1058,41 @@ impl SpreadsheetGrid {
                     .border_r_1()
                     .border_color(theme.surface0)
             )
-            .children(
-                (self.scroll_col..end_col).map(move |col| {
-                    let col_letter = CellPosition::new(0, col).to_reference();
-                    let col_letter: String = col_letter.chars().take_while(|c| c.is_alphabetic()).collect();
-                    let is_selected = col == selected_col;
-                    let col_width = column_widths[col];
+            .child(
+                // Clipped container for column headers with horizontal scroll offset
+                div()
+                    .flex_1()
+                    .h_full()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .h_full()
+                            .ml(px(-offset_x))
+                            .children(
+                                (self.scroll_col..end_col).map(move |col| {
+                                    let col_letter = CellPosition::new(0, col).to_reference();
+                                    let col_letter: String = col_letter.chars().take_while(|c| c.is_alphabetic()).collect();
+                                    let is_selected = col == selected_col;
+                                    let col_width = column_widths[col];
 
-                    div()
-                        .w(px(col_width))
-                        .h_full()
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .border_r_1()
-                        .border_color(theme.surface0)
-                        .text_size(px(12.))
-                        .text_color(if is_selected { theme.accent } else { theme.subtext0 })
-                        .font_weight(if is_selected { FontWeight::BOLD } else { FontWeight::NORMAL })
-                        .child(col_letter)
-                })
+                                    div()
+                                        .w(px(col_width))
+                                        .h_full()
+                                        .flex_none()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .border_r_1()
+                                        .border_color(theme.surface0)
+                                        .text_size(px(12.))
+                                        .text_color(if is_selected { theme.accent } else { theme.subtext0 })
+                                        .font_weight(if is_selected { FontWeight::BOLD } else { FontWeight::NORMAL })
+                                        .child(col_letter)
+                                })
+                            )
+                    )
             )
     }
 
@@ -976,6 +1108,8 @@ impl SpreadsheetGrid {
         let mode = self.mode;
         let active_input = self.active_input.clone();
         let scroll_col = self.scroll_col;
+        let offset_x = self.scroll_offset_x;
+        let offset_y = self.scroll_offset_y;
 
         div()
             .id("grid-area")
@@ -1010,110 +1144,131 @@ impl SpreadsheetGrid {
                     });
                 }
             })
-            .children(
-                (self.scroll_row..end_row).map(move |row| {
-                    let is_row_selected = row == selected.row;
-                    let row_height = row_heights[row];
-                    let column_widths = column_widths.clone();
-                    let cells = cells.clone();
-                    let entity = entity.clone();
-                    let active_input = active_input.clone();
-
-                    div()
-                        .flex()
-                        .flex_row()
-                        .h(px(row_height))
-                        .child({
-                            // Row header with resize handling
+            .child(
+                // Inner container with vertical scroll offset
+                div()
+                    .flex()
+                    .flex_col()
+                    .mt(px(-offset_y))
+                    .children(
+                        (self.scroll_row..end_row).map(move |row| {
+                            let is_row_selected = row == selected.row;
+                            let row_height = row_heights[row];
+                            let column_widths = column_widths.clone();
+                            let cells = cells.clone();
                             let entity = entity.clone();
-                            div()
-                                .id(ElementId::Name(format!("row-header-{}", row).into()))
-                                .w(px(ROW_HEADER_WIDTH))
-                                .h_full()
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .bg(theme.mantle)
-                                .border_r_1()
-                                .border_b_1()
-                                .border_color(theme.surface0)
-                                .text_size(px(12.))
-                                .text_color(if is_row_selected { theme.accent } else { theme.subtext0 })
-                                .font_weight(if is_row_selected { FontWeight::BOLD } else { FontWeight::NORMAL })
-                                .on_mouse_down(MouseButton::Left, {
-                                    move |event, _window, app| {
-                                        entity.update(app, |grid, cx| {
-                                            grid.on_row_header_mouse_down(event, 0.0, cx);
-                                        });
-                                    }
-                                })
-                                .child(format!("{}", row + 1))
-                        })
-                        .children(
-                            (scroll_col..end_col).map(move |col| {
-                                let is_selected = row == selected.row && col == selected.col;
-                                let content = cells[row][col].clone();
-                                let col_width = column_widths[col];
-                                let entity = entity.clone();
+                            let active_input = active_input.clone();
 
-                                if is_selected && mode == Mode::Edit {
-                                    // Render the active input for selected cell in edit mode
+                            div()
+                                .flex()
+                                .flex_row()
+                                .h(px(row_height))
+                                .child({
+                                    // Row header with resize handling
+                                    let entity = entity.clone();
                                     div()
-                                        .id(ElementId::Name(format!("cell-edit-{}-{}", row, col).into()))
-                                        .w(px(col_width))
-                                        .h(px(row_height))
-                                        .flex_none()
-                                        .border_2()
-                                        .border_color(theme.accent)
-                                        .overflow_hidden()
-                                        .child(active_input.clone())
-                                } else {
-                                    // Render static cell with multiline support
-                                    let has_newlines = content.contains('\n');
-                                    div()
-                                        .id(ElementId::Name(format!("cell-{}-{}", row, col).into()))
-                                        .w(px(col_width))
-                                        .h(px(row_height))
+                                        .id(ElementId::Name(format!("row-header-{}", row).into()))
+                                        .w(px(ROW_HEADER_WIDTH))
+                                        .h_full()
                                         .flex_none()
                                         .flex()
-                                        .flex_col()
-                                        .when(!has_newlines, |d| d.items_center().justify_center())
-                                        .when(has_newlines, |d| d.items_start().pt(px(2.)))
-                                        .px(px(4.))
+                                        .items_center()
+                                        .justify_center()
+                                        .bg(theme.mantle)
                                         .border_r_1()
                                         .border_b_1()
-                                        .border_color(if is_selected { theme.accent } else { theme.surface0 })
-                                        .when(is_selected, |d| d.border_2())
-                                        .bg(if is_selected { theme.surface0 } else { theme.base })
-                                        .text_size(px(14.))
-                                        .overflow_hidden()
+                                        .border_color(theme.surface0)
+                                        .text_size(px(12.))
+                                        .text_color(if is_row_selected { theme.accent } else { theme.subtext0 })
+                                        .font_weight(if is_row_selected { FontWeight::BOLD } else { FontWeight::NORMAL })
                                         .on_mouse_down(MouseButton::Left, {
-                                            move |event, window, app| {
-                                                if event.click_count == 2 {
-                                                    entity.update(app, |this, cx| {
-                                                        this.on_cell_double_click(row, col, window, cx);
-                                                    });
-                                                } else {
-                                                    entity.update(app, |this, cx| {
-                                                        this.on_cell_click(row, col, window, cx);
-                                                    });
-                                                }
+                                            move |event, _window, app| {
+                                                entity.update(app, |grid, cx| {
+                                                    grid.on_row_header_mouse_down(event, 0.0, cx);
+                                                });
                                             }
                                         })
-                                        .when(!has_newlines, |d| d.child(content.clone()))
-                                        .when(has_newlines, |d| {
-                                            d.children(content.lines().map(|line| {
-                                                div()
-                                                    .w_full()
-                                                    .line_height(px(18.))
-                                                    .child(line.to_string())
-                                            }))
-                                        })
-                                }
-                            })
-                        )
-                })
+                                        .child(format!("{}", row + 1))
+                                })
+                                .child(
+                                    // Clipped container for cells with horizontal scroll offset
+                                    div()
+                                        .flex_1()
+                                        .h_full()
+                                        .overflow_hidden()
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_row()
+                                                .h_full()
+                                                .ml(px(-offset_x))
+                                                .children(
+                                                    (scroll_col..end_col).map(move |col| {
+                                                        let is_selected = row == selected.row && col == selected.col;
+                                                        let content = cells[row][col].clone();
+                                                        let col_width = column_widths[col];
+                                                        let entity = entity.clone();
+
+                                                        if is_selected && mode == Mode::Edit {
+                                                            // Render the active input for selected cell in edit mode
+                                                            div()
+                                                                .id(ElementId::Name(format!("cell-edit-{}-{}", row, col).into()))
+                                                                .w(px(col_width))
+                                                                .h(px(row_height))
+                                                                .flex_none()
+                                                                .border_2()
+                                                                .border_color(theme.accent)
+                                                                .overflow_hidden()
+                                                                .child(active_input.clone())
+                                                        } else {
+                                                            // Render static cell with multiline support
+                                                            let has_newlines = content.contains('\n');
+                                                            div()
+                                                                .id(ElementId::Name(format!("cell-{}-{}", row, col).into()))
+                                                                .w(px(col_width))
+                                                                .h(px(row_height))
+                                                                .flex_none()
+                                                                .flex()
+                                                                .flex_col()
+                                                                .when(!has_newlines, |d| d.items_center().justify_center())
+                                                                .when(has_newlines, |d| d.items_start().pt(px(2.)))
+                                                                .px(px(4.))
+                                                                .border_r_1()
+                                                                .border_b_1()
+                                                                .border_color(if is_selected { theme.accent } else { theme.surface0 })
+                                                                .when(is_selected, |d| d.border_2())
+                                                                .bg(if is_selected { theme.surface0 } else { theme.base })
+                                                                .text_size(px(14.))
+                                                                .overflow_hidden()
+                                                                .on_mouse_down(MouseButton::Left, {
+                                                                    move |event, window, app| {
+                                                                        if event.click_count == 2 {
+                                                                            entity.update(app, |this, cx| {
+                                                                                this.on_cell_double_click(row, col, window, cx);
+                                                                            });
+                                                                        } else {
+                                                                            entity.update(app, |this, cx| {
+                                                                                this.on_cell_click(row, col, window, cx);
+                                                                            });
+                                                                        }
+                                                                    }
+                                                                })
+                                                                .when(!has_newlines, |d| d.child(content.clone()))
+                                                                .when(has_newlines, |d| {
+                                                                    d.children(content.lines().map(|line| {
+                                                                        div()
+                                                                            .w_full()
+                                                                            .line_height(px(18.))
+                                                                            .child(line.to_string())
+                                                                    }))
+                                                                })
+                                                        }
+                                                    })
+                                                )
+                                        )
+                                )
+                        })
+                    )
             )
     }
 
@@ -1201,11 +1356,13 @@ impl Render for SpreadsheetGrid {
         let show_palette = self.show_command_palette;
 
         div()
+            .id("spreadsheet-root")
             .flex()
             .flex_col()
             .size_full()
             .key_context(key_context)
             .track_focus(&self.focus_handle)
+            .on_scroll_wheel(cx.listener(Self::handle_scroll_wheel))
             // Normal mode actions
             .on_action(cx.listener(Self::move_up))
             .on_action(cx.listener(Self::move_down))
