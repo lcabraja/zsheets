@@ -77,7 +77,7 @@ actions!(
 );
 
 // Global actions
-actions!(spreadsheet, [Quit]);
+actions!(spreadsheet, [Quit, ToggleKeepCursorInView]);
 
 // File operation actions
 actions!(
@@ -132,12 +132,17 @@ pub struct SpreadsheetGrid {
     mode: Mode,
     visible_rows: usize,
     visible_cols: usize,
+    grid_height: f32,
+    grid_width: f32,
     file_state: FileState,
     command_palette: Entity<CommandPalette>,
     show_command_palette: bool,
     // Scroll pixel offsets for smooth scrolling
     scroll_offset_x: f32,
     scroll_offset_y: f32,
+    // When true, scrolling moves the cursor to stay in view
+    // When false, cursor stays put; arrow keys snap viewport back to cursor
+    keep_cursor_in_view: bool,
     // Resizing support
     column_widths: Vec<f32>,
     row_heights: Vec<f32>,
@@ -165,9 +170,12 @@ impl SpreadsheetGrid {
             scroll_col: 0,
             scroll_offset_x: 0.0,
             scroll_offset_y: 0.0,
+            keep_cursor_in_view: false,
             mode: Mode::Normal,
             visible_rows: 20,
             visible_cols: 10,
+            grid_height: 0.0,
+            grid_width: 0.0,
             file_state: FileState::new(),
             command_palette,
             show_command_palette: false,
@@ -417,6 +425,12 @@ impl SpreadsheetGrid {
         cx.notify();
     }
 
+    fn toggle_keep_cursor_in_view(&mut self, _: &ToggleKeepCursorInView, _window: &mut Window, cx: &mut Context<Self>) {
+        self.keep_cursor_in_view = !self.keep_cursor_in_view;
+        crate::menu::setup_menu_with_state(cx, self.keep_cursor_in_view);
+        cx.notify();
+    }
+
     // Command palette
     fn show_command_palette(&mut self, _: &ShowCommandPalette, window: &mut Window, cx: &mut Context<Self>) {
         // Exit edit mode if active
@@ -502,35 +516,101 @@ impl SpreadsheetGrid {
     }
 
     fn ensure_visible(&mut self) {
-        let mut scrolled = false;
-
-        // Vertical scrolling
+        // Vertical: cursor above viewport or partially hidden at top
         if self.selected.row < self.scroll_row
             || (self.selected.row == self.scroll_row && self.scroll_offset_y > 0.0)
         {
             self.scroll_row = self.selected.row;
-            scrolled = true;
-        } else if self.selected.row >= self.scroll_row + self.visible_rows {
-            self.scroll_row = self.selected.row.saturating_sub(self.visible_rows - 1);
-            scrolled = true;
+            self.scroll_offset_y = 0.0;
+        } else {
+            // Check if cursor row is partially clipped at the bottom
+            let last_full_row = self.last_fully_visible_row();
+            if self.selected.row > last_full_row {
+                // Scroll down so cursor row is fully visible at the bottom
+                self.scroll_to_show_row_at_bottom(self.selected.row);
+            }
         }
 
-        // Horizontal scrolling
+        // Horizontal: cursor left of viewport or partially hidden at left
         if self.selected.col < self.scroll_col
             || (self.selected.col == self.scroll_col && self.scroll_offset_x > 0.0)
         {
             self.scroll_col = self.selected.col;
-            scrolled = true;
-        } else if self.selected.col >= self.scroll_col + self.visible_cols {
-            self.scroll_col = self.selected.col.saturating_sub(self.visible_cols - 1);
-            scrolled = true;
-        }
-
-        // Reset pixel offsets when keyboard navigation causes scrolling
-        if scrolled {
             self.scroll_offset_x = 0.0;
-            self.scroll_offset_y = 0.0;
+        } else {
+            // Check if cursor col is partially clipped at the right
+            let last_full_col = self.last_fully_visible_col();
+            if self.selected.col > last_full_col {
+                // Scroll right so cursor col is fully visible at the right
+                self.scroll_to_show_col_at_right(self.selected.col);
+            }
         }
+    }
+
+    /// Find the last row index that is fully visible in the viewport
+    fn last_fully_visible_row(&self) -> usize {
+        let grid_height = self.grid_height;
+        let mut total = 0.0;
+        for (i, row) in (self.scroll_row..GRID_ROWS).enumerate() {
+            let h = self.row_heights[row];
+            let visible_h = if i == 0 { h - self.scroll_offset_y } else { h };
+            total += visible_h;
+            if total > grid_height {
+                // This row is partially clipped; the previous row is the last fully visible
+                return if row > self.scroll_row { row - 1 } else { self.scroll_row };
+            }
+        }
+        (GRID_ROWS - 1).min(self.scroll_row + self.visible_rows - 1)
+    }
+
+    /// Find the last column index that is fully visible in the viewport
+    fn last_fully_visible_col(&self) -> usize {
+        let grid_width = self.grid_width;
+        let mut total = 0.0;
+        for (i, col) in (self.scroll_col..GRID_COLS).enumerate() {
+            let w = self.column_widths[col];
+            let visible_w = if i == 0 { w - self.scroll_offset_x } else { w };
+            total += visible_w;
+            if total > grid_width {
+                return if col > self.scroll_col { col - 1 } else { self.scroll_col };
+            }
+        }
+        (GRID_COLS - 1).min(self.scroll_col + self.visible_cols - 1)
+    }
+
+    /// Scroll viewport so that `target_row` is fully visible at the bottom edge
+    fn scroll_to_show_row_at_bottom(&mut self, target_row: usize) {
+        let grid_height = self.grid_height;
+        // Walk backwards from target_row to find where scroll_row should be
+        let mut total = 0.0;
+        let mut new_scroll_row = target_row;
+        for row in (0..=target_row).rev() {
+            total += self.row_heights[row];
+            if total > grid_height {
+                new_scroll_row = row + 1;
+                break;
+            }
+            new_scroll_row = row;
+        }
+        self.scroll_row = new_scroll_row;
+        self.scroll_offset_y = 0.0;
+    }
+
+    /// Scroll viewport so that `target_col` is fully visible at the right edge
+    fn scroll_to_show_col_at_right(&mut self, target_col: usize) {
+        let grid_width = self.grid_width;
+        let mut total = 0.0;
+        let mut new_scroll_col = target_col;
+        for col in (0..=target_col).rev() {
+            total += self.column_widths[col];
+            if total > grid_width {
+                new_scroll_col = col + 1;
+                break;
+            }
+            new_scroll_col = col;
+        }
+        self.scroll_col = new_scroll_col;
+        self.scroll_offset_x = 0.0;
     }
 
     /// Calculate number of visible rows from scroll position that fit in given height
@@ -868,6 +948,11 @@ impl SpreadsheetGrid {
                 self.apply_smooth_scroll(f32::from(-delta.x), f32::from(-delta.y));
             }
         }
+
+        if self.keep_cursor_in_view {
+            self.clamp_cursor_to_viewport();
+        }
+
         cx.notify();
     }
 
@@ -925,6 +1010,36 @@ impl SpreadsheetGrid {
             if self.scroll_offset_x > 0.0 {
                 self.scroll_offset_x = 0.0;
             }
+        }
+    }
+
+    /// Move the cursor into the fully visible viewport (used when keep_cursor_in_view is enabled)
+    fn clamp_cursor_to_viewport(&mut self) {
+        // First fully visible row: if pixel offset hides part of scroll_row, skip it
+        let first_full_row = if self.scroll_offset_y > 0.0 {
+            (self.scroll_row + 1).min(GRID_ROWS - 1)
+        } else {
+            self.scroll_row
+        };
+        let last_full_row = self.last_fully_visible_row();
+
+        if self.selected.row < first_full_row {
+            self.selected.row = first_full_row;
+        } else if self.selected.row > last_full_row {
+            self.selected.row = last_full_row;
+        }
+
+        let first_full_col = if self.scroll_offset_x > 0.0 {
+            (self.scroll_col + 1).min(GRID_COLS - 1)
+        } else {
+            self.scroll_col
+        };
+        let last_full_col = self.last_fully_visible_col();
+
+        if self.selected.col < first_full_col {
+            self.selected.col = first_full_col;
+        } else if self.selected.col > last_full_col {
+            self.selected.col = last_full_col;
         }
     }
 
@@ -1325,12 +1440,12 @@ impl Render for SpreadsheetGrid {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Calculate visible rows and columns based on window size
         let content_bounds = window.viewport_size();
-        let grid_height = f32::from(content_bounds.height) - HEADER_HEIGHT - COLUMN_HEADER_HEIGHT - FOOTER_HEIGHT;
-        let grid_width = f32::from(content_bounds.width) - ROW_HEADER_WIDTH;
+        self.grid_height = f32::from(content_bounds.height) - HEADER_HEIGHT - COLUMN_HEADER_HEIGHT - FOOTER_HEIGHT;
+        self.grid_width = f32::from(content_bounds.width) - ROW_HEADER_WIDTH;
 
         // Calculate visible rows by summing row heights from scroll position
-        self.visible_rows = self.calculate_visible_rows(grid_height);
-        self.visible_cols = self.calculate_visible_cols(grid_width);
+        self.visible_rows = self.calculate_visible_rows(self.grid_height);
+        self.visible_cols = self.calculate_visible_cols(self.grid_width);
 
         // Ensure selection is still visible after resize
         self.ensure_visible();
@@ -1384,6 +1499,7 @@ impl Render for SpreadsheetGrid {
             .on_action(cx.listener(Self::close_file))
             .on_action(cx.listener(Self::force_quit))
             .on_action(cx.listener(Self::toggle_read_only))
+            .on_action(cx.listener(Self::toggle_keep_cursor_in_view))
             // Command palette actions
             .on_action(cx.listener(Self::show_command_palette))
             .on_action(cx.listener(Self::hide_command_palette))
