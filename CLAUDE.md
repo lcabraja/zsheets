@@ -242,3 +242,59 @@ let value = self.child_entity.read(cx).get_value();
 - Check key contexts match between bindings and `key_context()`
 - Ensure `track_focus()` is called for keyboard input to work
 - Use `.id()` on elements that need mouse events or state
+
+## Feature TODO
+
+### Core Editing
+- [ ] Cell range selection (shift+click, shift+arrow, drag)
+- [ ] Copy/paste/cut for cells and ranges
+- [ ] Undo/redo history
+- [ ] Delete cell contents in normal mode
+- [ ] Fill down/right
+
+### Formulas
+- [ ] Formula engine (`=SUM(A1:A10)`, `=A1+B2`, etc.)
+- [ ] Cell references and dependency graph
+- [ ] Auto-recalculation on edit
+- [ ] Common functions (SUM, AVG, MIN, MAX, COUNT, IF, VLOOKUP)
+- [ ] Relative vs absolute references (`$A$1`)
+- [ ] Circular reference detection
+
+### Formatting
+- [ ] Bold, italic, underline per cell
+- [ ] Text alignment (left/center/right)
+- [ ] Number formatting (currency, percentage, dates, decimals)
+- [ ] Cell background colors
+- [ ] Font size per cell
+- [ ] Cell borders (custom per-edge)
+- [ ] Conditional formatting
+- [ ] Merge cells
+
+### Data Management
+- [ ] Sort by column
+- [ ] Filter rows by value or condition
+- [ ] Find and replace
+- [ ] Multiple sheets/tabs
+- [ ] Named ranges
+- [ ] Freeze rows/columns (split panes)
+- [ ] Hide/show rows and columns
+
+### Navigation
+- [ ] Goto cell (ctrl+g or `:goto A50`)
+- [ ] Page up/down, ctrl+home/end
+- [ ] Vim motions: `gg`, `G`, `0`, `$`, `w`, `b`
+- [ ] Visual mode for range selection (vim `v`)
+
+### Import/Export
+- [ ] TSV import/export
+- [ ] Excel (.xlsx) read/write
+- [ ] JSON export
+- [ ] Print / export to PDF
+
+### Polish
+- [ ] Status bar showing SUM/AVG/COUNT of selection
+- [ ] Column/row insert and delete
+- [ ] Drag and drop cells
+- [ ] Auto-fill series (1,2,3... or Mon,Tue,Wed...)
+- [ ] Cell comments/notes
+- [ ] Wrap text toggle per cell
