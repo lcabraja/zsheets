@@ -578,39 +578,33 @@ impl SpreadsheetGrid {
         (GRID_COLS - 1).min(self.scroll_col + self.visible_cols - 1)
     }
 
-    /// Scroll viewport so that `target_row` is fully visible at the bottom edge
+    /// Scroll viewport by just enough pixels to fully reveal `target_row` at the bottom
     fn scroll_to_show_row_at_bottom(&mut self, target_row: usize) {
-        let grid_height = self.grid_height;
-        // Walk backwards from target_row to find where scroll_row should be
+        // Compute how far the bottom edge of target_row extends past the viewport
         let mut total = 0.0;
-        let mut new_scroll_row = target_row;
-        for row in (0..=target_row).rev() {
-            total += self.row_heights[row];
-            if total > grid_height {
-                new_scroll_row = row + 1;
-                break;
-            }
-            new_scroll_row = row;
+        for (i, row) in (self.scroll_row..=target_row).enumerate() {
+            let h = self.row_heights[row];
+            let visible_h = if i == 0 { h - self.scroll_offset_y } else { h };
+            total += visible_h;
         }
-        self.scroll_row = new_scroll_row;
-        self.scroll_offset_y = 0.0;
+        let overflow = total - self.grid_height;
+        if overflow > 0.0 {
+            self.apply_smooth_scroll(0.0, overflow);
+        }
     }
 
-    /// Scroll viewport so that `target_col` is fully visible at the right edge
+    /// Scroll viewport by just enough pixels to fully reveal `target_col` at the right
     fn scroll_to_show_col_at_right(&mut self, target_col: usize) {
-        let grid_width = self.grid_width;
         let mut total = 0.0;
-        let mut new_scroll_col = target_col;
-        for col in (0..=target_col).rev() {
-            total += self.column_widths[col];
-            if total > grid_width {
-                new_scroll_col = col + 1;
-                break;
-            }
-            new_scroll_col = col;
+        for (i, col) in (self.scroll_col..=target_col).enumerate() {
+            let w = self.column_widths[col];
+            let visible_w = if i == 0 { w - self.scroll_offset_x } else { w };
+            total += visible_w;
         }
-        self.scroll_col = new_scroll_col;
-        self.scroll_offset_x = 0.0;
+        let overflow = total - self.grid_width;
+        if overflow > 0.0 {
+            self.apply_smooth_scroll(overflow, 0.0);
+        }
     }
 
     /// Calculate number of visible rows from scroll position that fit in given height
